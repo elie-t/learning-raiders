@@ -1,0 +1,7 @@
+serviceAccountKey.json
+*.key
+.env*
+node_modules/
+dist/
+build/
+.expo/
