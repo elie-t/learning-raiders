@@ -1,5 +1,5 @@
 // ==========================================
-// src/screens/LoginScreen.tsx — Final Production Version (Netlify Hosted)
+// src/screens/LoginScreen.tsx — Enhanced Production Version (Netlify Hosted)
 // ==========================================
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -34,6 +34,7 @@ const USE_PROXY = false; // No need for Expo proxy on production web
 export default function LoginScreen({ navigation }: any) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [debugInfo, setDebugInfo] = useState<string>("");
   const processedCodesRef = useRef(new Set<string>());
 
   // Microsoft discovery (authorization/token endpoints)
@@ -41,6 +42,26 @@ export default function LoginScreen({ navigation }: any) {
 
   // Random state for PKCE and replay protection
   const state = useMemo(() => Math.random().toString(36).slice(2, 12), []);
+
+  // 🔹 Enhanced session handling for web
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      // Clear any existing auth session on web
+      WebBrowser.maybeCompleteAuthSession();
+      
+      // Check URL for auth response on page load
+      const urlParams = new URLSearchParams(window.location.search);
+      const fragment = window.location.hash.substring(1);
+      const fragmentParams = new URLSearchParams(fragment);
+      
+      const code = urlParams.get('code') || fragmentParams.get('code');
+      const error = urlParams.get('error') || fragmentParams.get('error');
+      
+      if (code || error) {
+        setDebugInfo(`URL contains auth response: code=${!!code}, error=${error}`);
+      }
+    }
+  }, []);
 
   // Build OAuth request
   const [request, response, promptAsync] = AuthSession.useAuthRequest(
@@ -52,7 +73,7 @@ export default function LoginScreen({ navigation }: any) {
       redirectUri: REDIRECT_URI,
       scopes: ["openid", "profile", "email", "offline_access", "User.Read"],
       extraParams: {
-        response_mode: "query",
+        response_mode: "fragment", // Changed from "query" for better Netlify compatibility
         prompt: "select_account",
         state,
       },
@@ -66,11 +87,37 @@ export default function LoginScreen({ navigation }: any) {
   useEffect(() => {
     if (!response) return;
 
+    // 🔍 Enhanced debugging
+    console.log("=== AUTH DEBUG START ===");
+    console.log("Response received:", {
+      type: response.type,
+      params: response.params,
+      error: (response as any).error,
+      url: typeof window !== 'undefined' ? window.location.href : 'N/A',
+      timestamp: new Date().toISOString()
+    });
+    
+    setDebugInfo(JSON.stringify({
+      type: response.type,
+      hasParams: !!response.params,
+      paramKeys: response.params ? Object.keys(response.params) : [],
+      url: typeof window !== 'undefined' ? window.location.href : 'N/A'
+    }, null, 2));
+    
+    console.log("=== AUTH DEBUG END ===");
+
     const handleAuthResponse = async () => {
       if (response.type !== "success") {
         const params: any = (response as any).params || {};
         const errorCode = params.error || "";
         const errorDescription = params.error_description || "";
+
+        console.error("[Auth] Error response:", {
+          type: response.type,
+          errorCode,
+          errorDescription,
+          allParams: params
+        });
 
         if (errorCode === "AADSTS50011") {
           setError(
@@ -82,8 +129,10 @@ export default function LoginScreen({ navigation }: any) {
           );
         } else if (response.type === "dismiss") {
           setError("Sign-in was cancelled. Please try again.");
+        } else if (response.type === "error") {
+          setError(`Authentication error: ${errorDescription || errorCode || "Unknown error"}`);
         } else {
-          setError(errorDescription || errorCode || "Authentication failed.");
+          setError(errorDescription || errorCode || `Authentication failed (${response.type}).`);
         }
         return;
       }
@@ -94,20 +143,45 @@ export default function LoginScreen({ navigation }: any) {
 
         const code = (response.params as any).code;
         const returnedState = (response.params as any).state;
-        if (!code) throw new Error("No authorization code received.");
-        if (returnedState !== state)
-          throw new Error("Invalid authentication state.");
+        
+        console.log("[Auth] Processing successful response:", {
+          hasCode: !!code,
+          codeLength: code?.length,
+          stateMatch: returnedState === state,
+          expectedState: state,
+          receivedState: returnedState
+        });
 
+        if (!code) {
+          console.error("[Auth] No authorization code in response params:", response.params);
+          throw new Error("No authorization code received from Microsoft.");
+        }
+        
+        if (returnedState !== state) {
+          console.error("[Auth] State mismatch:", { expected: state, received: returnedState });
+          throw new Error("Invalid authentication state - possible security issue.");
+        }
+
+        // Check for duplicate processing
         if (processedCodesRef.current.has(code)) {
-          console.log("[Auth] Duplicate code — ignored.");
+          console.log("[Auth] Duplicate code detected - ignoring.");
           setBusy(false);
           return;
         }
         processedCodesRef.current.add(code);
 
-        if (!discovery?.tokenEndpoint)
-          throw new Error("Microsoft discovery failed.");
-        if (!request?.codeVerifier) throw new Error("PKCE verification failed.");
+        // Validate dependencies
+        if (!discovery?.tokenEndpoint) {
+          console.error("[Auth] Discovery failed:", discovery);
+          throw new Error("Microsoft discovery failed - unable to get token endpoint.");
+        }
+        
+        if (!request?.codeVerifier) {
+          console.error("[Auth] PKCE verification missing:", { hasRequest: !!request });
+          throw new Error("PKCE verification failed - missing code verifier.");
+        }
+
+        console.log("[Auth] Exchanging code for tokens...");
 
         // 🔸 Exchange code for tokens
         const tokens = await AuthSession.exchangeCodeAsync(
@@ -123,11 +197,18 @@ export default function LoginScreen({ navigation }: any) {
         const idToken = (tokens as any)?.id_token;
         const accessToken = (tokens as any)?.access_token;
 
+        console.log("[Auth] Token exchange result:", {
+          hasIdToken: !!idToken,
+          hasAccessToken: !!accessToken,
+          tokenKeys: Object.keys(tokens || {})
+        });
+
         if (!idToken && !accessToken) {
+          console.error("[Auth] No tokens received:", tokens);
           throw new Error("No authentication tokens received from Microsoft.");
         }
 
-        console.log("[Auth] Token received from Microsoft.");
+        console.log("[Auth] Tokens received successfully. Signing in to Firebase...");
 
         // 🔸 Firebase sign-in
         const provider = new OAuthProvider("microsoft.com");
@@ -138,14 +219,23 @@ export default function LoginScreen({ navigation }: any) {
         const { user } = await signInWithCredential(auth, credential);
         const email = user.email?.trim().toLowerCase();
 
+        console.log("[Auth] Firebase sign-in successful:", {
+          uid: user.uid,
+          email: email,
+          displayName: user.displayName
+        });
+
         if (!email) {
           await signOut(auth);
           throw new Error("No email found in Microsoft account.");
         }
 
         // 🔸 Check authorized roster
+        console.log("[Auth] Checking roster for:", email);
         const rosterDoc = await getDoc(doc(db, "roster", email));
+        
         if (!rosterDoc.exists()) {
+          console.log("[Auth] User not in roster:", email);
           await signOut(auth);
           Alert.alert(
             "Access Denied",
@@ -156,6 +246,9 @@ export default function LoginScreen({ navigation }: any) {
         }
 
         const rosterData = rosterDoc.data() || {};
+        console.log("[Auth] Roster data found:", rosterData);
+
+        // 🔸 Create/update user document
         await setDoc(
           doc(db, "users", user.uid),
           {
@@ -170,11 +263,19 @@ export default function LoginScreen({ navigation }: any) {
           { merge: true }
         );
 
+        console.log("[Auth] User document updated successfully. Navigating to WorldMap...");
+        
+        // Clear processed codes and navigate
         processedCodesRef.current.clear();
         navigation.replace("WorldMap");
+        
       } catch (err: any) {
-        console.error("[Auth] Firebase sign-in error:", err);
-        setError(err?.message || "Authentication failed.");
+        console.error("[Auth] Error during authentication:", {
+          message: err?.message,
+          code: err?.code,
+          stack: err?.stack
+        });
+        setError(err?.message || "Authentication failed. Please try again.");
       } finally {
         setBusy(false);
       }
@@ -187,16 +288,32 @@ export default function LoginScreen({ navigation }: any) {
   // 🔹 Button handler
   // ================
   const handleSignIn = async () => {
+    console.log("[Auth] Sign-in button clicked");
     setError(null);
+    setDebugInfo("");
+    
     if (!request) {
+      console.error("[Auth] Request not ready:", { hasRequest: !!request, hasDiscovery: !!discovery });
       setError("Authentication not ready. Please wait and try again.");
       return;
     }
+    
     try {
+      console.log("[Auth] Starting OAuth flow...", {
+        redirectUri: REDIRECT_URI,
+        useProxy: USE_PROXY,
+        clientId: MICROSOFT_CLIENT_ID
+      });
+      
       processedCodesRef.current.clear();
-      await promptAsync({ useProxy: USE_PROXY, redirectUri: REDIRECT_URI });
+      await promptAsync({ 
+        useProxy: USE_PROXY, 
+        redirectUri: REDIRECT_URI 
+      });
+      
     } catch (err: any) {
-      setError(err?.message || "Failed to start sign-in.");
+      console.error("[Auth] Error starting sign-in:", err);
+      setError(err?.message || "Failed to start sign-in process.");
     }
   };
 
@@ -231,6 +348,14 @@ export default function LoginScreen({ navigation }: any) {
         {error && (
           <View style={styles.errorContainer}>
             <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+
+        {/* 🔍 Debug info for development */}
+        {__DEV__ && debugInfo && (
+          <View style={styles.debugContainer}>
+            <Text style={styles.debugTitle}>Debug Info:</Text>
+            <Text style={styles.debugText}>{debugInfo}</Text>
           </View>
         )}
 
@@ -298,6 +423,17 @@ const styles = StyleSheet.create({
     maxWidth: 400,
   },
   errorText: { color: "#c62828", fontSize: 14, textAlign: "center" },
+  debugContainer: {
+    backgroundColor: "#e3f2fd",
+    padding: 16,
+    borderRadius: 8,
+    marginBottom: 16,
+    borderLeftWidth: 4,
+    borderLeftColor: "#2196f3",
+    maxWidth: 500,
+  },
+  debugTitle: { color: "#1976d2", fontSize: 14, fontWeight: "600", marginBottom: 8 },
+  debugText: { color: "#1976d2", fontSize: 12, fontFamily: "monospace" },
   footerText: {
     fontSize: 12,
     color: "#999",
