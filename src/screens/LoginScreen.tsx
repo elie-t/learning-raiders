@@ -1,58 +1,76 @@
-// ==========================================
-// src/screens/LoginScreen.tsx — Final Production Version (Netlify Hosted)
-// ==========================================
+// src/screens/LoginScreen.tsx — Microsoft → Firebase (no roster check)
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
   Pressable,
-  Alert,
   ActivityIndicator,
   StyleSheet,
   Platform,
+  Alert,
 } from "react-native";
 import * as WebBrowser from "expo-web-browser";
 import * as AuthSession from "expo-auth-session";
 import { OAuthProvider, signInWithCredential, signOut } from "firebase/auth";
 import { auth, db } from "../services/firebaseClient";
-import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import { doc, setDoc, serverTimestamp } from "firebase/firestore";
 
-// ✅ Ensures proper web session handling
+// Make web popups complete the session properly
 WebBrowser.maybeCompleteAuthSession();
 
-// =====================
-// 🔹 Azure AD (Entra ID)
-// =====================
+/**
+ * === Azure AD app values ===
+ * Make sure these match your App Registration.
+ */
 const MICROSOFT_CLIENT_ID = "30f4acf0-ae27-4da2-aa10-45146236753d";
 const TENANT_ID = "4119dba0-2378-496b-968b-696ef51bad2a";
 const ISSUER = `https://login.microsoftonline.com/${TENANT_ID}/v2.0`;
 
-// ✅ Use your real deployed domain on Netlify
-const REDIRECT_URI = "https://learning-raiders.netlify.app";
-const USE_PROXY = false; // No need for Expo proxy on production web
+/**
+ * Redirect URI:
+ * - On web we use the current origin so it works for Netlify prod and localhost dev
+ *   (be sure this exact URL is added in Azure: e.g. https://learning-raiders.netlify.app and/or http://localhost:8081)
+ * - On native we go through the Expo proxy (no extra setup on Azure beyond adding https://auth.expo.dev/@yourUser/yourSlug if you use custom proxy).
+ */
+function useRedirectUri() {
+  return useMemo(() => {
+    if (Platform.OS === "web") {
+      const origin =
+        typeof window !== "undefined" ? window.location.origin : "http://localhost:8081";
+      console.log("[Auth] Web redirect URI:", origin);
+      return origin; // must be registered in Azure exactly
+    }
+    // Native / Expo Go
+    const uri = AuthSession.makeRedirectUri({ useProxy: true });
+    console.log("[Auth] Native redirect URI (proxy):", uri);
+    return uri;
+  }, []);
+}
 
 export default function LoginScreen({ navigation }: any) {
+  const redirectUri = useRedirectUri();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const processedCodesRef = useRef(new Set<string>());
 
-  // Microsoft discovery (authorization/token endpoints)
+  // Discovery for Azure endpoints
   const discovery = AuthSession.useAutoDiscovery(ISSUER);
 
-  // Random state for PKCE and replay protection
+  // Stable state for CSRF/replay protection
   const state = useMemo(() => Math.random().toString(36).slice(2, 12), []);
 
-  // Build OAuth request
+  // Build the OAuth authorization request
   const [request, response, promptAsync] = AuthSession.useAuthRequest(
     {
       clientId: MICROSOFT_CLIENT_ID,
       responseType: AuthSession.ResponseType.Code,
       usePKCE: true,
       codeChallengeMethod: AuthSession.CodeChallengeMethod.S256,
-      redirectUri: REDIRECT_URI,
+      redirectUri,
       scopes: ["openid", "profile", "email", "offline_access", "User.Read"],
       extraParams: {
-        response_mode: "query",
+        // Query is easiest for web; fragment also works with proxy flows
+        response_mode: Platform.OS === "web" ? "query" : "fragment",
         prompt: "select_account",
         state,
       },
@@ -60,9 +78,7 @@ export default function LoginScreen({ navigation }: any) {
     discovery
   );
 
-  // ==============
-  // 🔹 Handle login
-  // ==============
+  // Handle the auth response
   useEffect(() => {
     if (!response) return;
 
@@ -72,18 +88,16 @@ export default function LoginScreen({ navigation }: any) {
         const errorCode = params.error || "";
         const errorDescription = params.error_description || "";
 
-        if (errorCode === "AADSTS50011") {
+        if (errorCode === "AADSTS50011" || errorDescription.includes("AADSTS50011")) {
           setError(
-            "Redirect URI mismatch — make sure your Azure app includes this domain."
+            "Redirect URI mismatch. Make sure this exact URL is added in Azure."
           );
-        } else if (errorCode === "AADSTS50020") {
-          setError(
-            "Please sign in with your @sagesshs.edu.lb account only."
-          );
+        } else if (errorCode === "AADSTS50020" || errorDescription.includes("AADSTS50020")) {
+          setError("Please sign in with your @sagesshs.edu.lb account.");
         } else if (response.type === "dismiss") {
-          setError("Sign-in was cancelled. Please try again.");
+          setError("Sign-in was cancelled.");
         } else {
-          setError(errorDescription || errorCode || "Authentication failed.");
+          setError(errorDescription || errorCode || `Authentication ${response.type}`);
         }
         return;
       }
@@ -92,29 +106,30 @@ export default function LoginScreen({ navigation }: any) {
         setBusy(true);
         setError(null);
 
-        const code = (response.params as any).code;
-        const returnedState = (response.params as any).state;
-        if (!code) throw new Error("No authorization code received.");
-        if (returnedState !== state)
-          throw new Error("Invalid authentication state.");
+        const params: any = (response as any).params || {};
+        const code: string = String(params.code || "");
+        const returnedState: string | undefined = params.state;
 
+        if (!code) throw new Error("No authorization code received.");
+        if (returnedState && returnedState !== state)
+          throw new Error("Invalid authentication state");
+
+        // avoid Fast Refresh double-processing
         if (processedCodesRef.current.has(code)) {
-          console.log("[Auth] Duplicate code — ignored.");
-          setBusy(false);
+          console.log("[Auth] Duplicate code ignored");
           return;
         }
         processedCodesRef.current.add(code);
 
-        if (!discovery?.tokenEndpoint)
-          throw new Error("Microsoft discovery failed.");
-        if (!request?.codeVerifier) throw new Error("PKCE verification failed.");
+        if (!discovery?.tokenEndpoint) throw new Error("Microsoft discovery failed");
+        if (!request?.codeVerifier) throw new Error("PKCE verification failed");
 
-        // 🔸 Exchange code for tokens
+        // Exchange the code for tokens
         const tokens = await AuthSession.exchangeCodeAsync(
           {
             clientId: MICROSOFT_CLIENT_ID,
             code,
-            redirectUri: REDIRECT_URI,
+            redirectUri,
             extraParams: { code_verifier: request.codeVerifier },
           },
           { tokenEndpoint: discovery.tokenEndpoint }
@@ -122,87 +137,78 @@ export default function LoginScreen({ navigation }: any) {
 
         const idToken = (tokens as any)?.id_token;
         const accessToken = (tokens as any)?.access_token;
+        if (!idToken && !accessToken)
+          throw new Error("No authentication tokens received from Microsoft");
 
-        if (!idToken && !accessToken) {
-          throw new Error("No authentication tokens received from Microsoft.");
-        }
+        console.log("[Auth] Tokens acquired (id/access). Proceeding to Firebase…");
 
-        console.log("[Auth] Token received from Microsoft.");
-
-        // 🔸 Firebase sign-in
+        // Sign into Firebase using Microsoft provider
         const provider = new OAuthProvider("microsoft.com");
         const credential = idToken
           ? provider.credential({ idToken, accessToken })
           : provider.credential({ accessToken });
 
         const { user } = await signInWithCredential(auth, credential);
-        const email = user.email?.trim().toLowerCase();
 
+        const email = user.email?.trim().toLowerCase();
         if (!email) {
           await signOut(auth);
-          throw new Error("No email found in Microsoft account.");
+          throw new Error("No email address present on Microsoft account");
         }
 
-        // 🔸 Check authorized roster
-        const rosterDoc = await getDoc(doc(db, "roster", email));
-        if (!rosterDoc.exists()) {
-          await signOut(auth);
-          Alert.alert(
-            "Access Denied",
-            `Account ${email} is not in the roster.\nPlease contact your administrator.`
-          );
-          setBusy(false);
-          return;
-        }
-
-        const rosterData = rosterDoc.data() || {};
+        // Create/update a basic user profile (NO ROSTER CHECK)
         await setDoc(
           doc(db, "users", user.uid),
           {
             uid: user.uid,
             email,
-            displayName: rosterData.name || user.displayName || "",
-            role: rosterData.role || "student",
-            grade: rosterData.grade || "",
-            guildId: (rosterData.grade || "").toLowerCase(),
+            displayName: user.displayName || "",
             lastLoginAt: serverTimestamp(),
+            // you can add any defaults you like here
+            role: "student",
+            grade: "",
+            guildId: "",
           },
           { merge: true }
         );
 
         processedCodesRef.current.clear();
+
+        // Go to your main app
         navigation.replace("WorldMap");
       } catch (err: any) {
         console.error("[Auth] Firebase sign-in error:", err);
-        setError(err?.message || "Authentication failed.");
+        // allow retry by removing the processed code if we added it
+        const code = (response as any)?.params?.code;
+        if (code) processedCodesRef.current.delete(String(code));
+        setError(err?.message || "Authentication failed. Please try again.");
       } finally {
         setBusy(false);
       }
     };
 
     handleAuthResponse();
-  }, [response, discovery, request, state, navigation]);
+  }, [response, discovery, request, state, navigation, redirectUri]);
 
-  // ================
-  // 🔹 Button handler
-  // ================
+  // Start the auth flow
   const handleSignIn = async () => {
     setError(null);
     if (!request) {
-      setError("Authentication not ready. Please wait and try again.");
+      setError("Authentication not ready. Try again in a moment.");
       return;
     }
+
     try {
       processedCodesRef.current.clear();
-      await promptAsync({ useProxy: USE_PROXY, redirectUri: REDIRECT_URI });
+      await promptAsync({
+        useProxy: Platform.OS !== "web", // proxy on native; direct on web
+        redirectUri,
+      } as any);
     } catch (err: any) {
-      setError(err?.message || "Failed to start sign-in.");
+      setError(err?.message || "Failed to start sign-in");
     }
   };
 
-  // =================
-  // 🔹 UI / Rendering
-  // =================
   return (
     <View style={styles.container}>
       <View style={styles.content}>
@@ -225,43 +231,28 @@ export default function LoginScreen({ navigation }: any) {
         </Pressable>
 
         {!request && (
-          <Text style={styles.loadingText}>Preparing authentication...</Text>
+          <Text style={styles.loadingText}>Preparing authentication…</Text>
         )}
 
-        {error && (
+        {!!error && (
           <View style={styles.errorContainer}>
             <Text style={styles.errorText}>{error}</Text>
           </View>
         )}
 
         <Text style={styles.footerText}>
-          Use your @sagesshs.edu.lb account to access this application
+          Use your @sagesshs.edu.lb account to access the application
         </Text>
       </View>
     </View>
   );
 }
 
-// ====================
-// 🎨 Styling
-// ====================
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#f5f5f5" },
   content: { flex: 1, justifyContent: "center", alignItems: "center", padding: 32 },
-  title: {
-    fontSize: 32,
-    fontWeight: "bold",
-    color: "#333",
-    marginBottom: 8,
-    textAlign: "center",
-  },
-  subtitle: {
-    fontSize: 18,
-    color: "#666",
-    fontStyle: "italic",
-    marginBottom: 48,
-    textAlign: "center",
-  },
+  title: { fontSize: 32, fontWeight: "bold", color: "#333", marginBottom: 8, textAlign: "center" },
+  subtitle: { fontSize: 18, color: "#666", fontStyle: "italic", marginBottom: 48, textAlign: "center" },
   signInButton: {
     backgroundColor: "#0078d4",
     paddingVertical: 16,
@@ -282,12 +273,10 @@ const styles = StyleSheet.create({
   },
   signInButtonDisabled: {
     backgroundColor: "#ccc",
-    ...(Platform.OS === "web"
-      ? { boxShadow: "none" }
-      : { shadowOpacity: 0, elevation: 0 }),
+    ...(Platform.OS === "web" ? { boxShadow: "none" } : { shadowOpacity: 0, elevation: 0 }),
   },
   signInButtonText: { color: "white", fontSize: 16, fontWeight: "600" },
-  loadingText: { fontSize: 14, color: "#666", marginBottom: 16 },
+  loadingText: { fontSize: 14, color: "#666", textAlign: "center", marginBottom: 16 },
   errorContainer: {
     backgroundColor: "#ffebee",
     padding: 16,
@@ -295,14 +284,8 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     borderLeftWidth: 4,
     borderLeftColor: "#f44336",
-    maxWidth: 400,
+    maxWidth: 420,
   },
   errorText: { color: "#c62828", fontSize: 14, textAlign: "center" },
-  footerText: {
-    fontSize: 12,
-    color: "#999",
-    textAlign: "center",
-    marginTop: 32,
-    maxWidth: 300,
-  },
+  footerText: { fontSize: 12, color: "#999", textAlign: "center", marginTop: 32, maxWidth: 320 },
 });
